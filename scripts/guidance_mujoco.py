@@ -11,41 +11,23 @@ class Guidance:
         with tf.variable_scope('guidance'):
             self.scope = tf.get_variable_scope().name
 
-            self.agent_s = tf.placeholder(dtype=tf.float32, 
-                                          shape=[None] + list(env.observation_space.shape),
-                                          name='ph_agent_s')
-            self.agent_a = tf.placeholder(dtype=tf.float32, 
-                                          shape=[None] + list(env.action_space.shape), 
-                                          name='ph_agent_a')
-            self.expert_a = tf.placeholder(dtype=tf.float32, 
-                                           shape=[None] + list(env.action_space.shape),
-                                           name='ph_expert_a')
+            self.agent_s = tf.placeholder(dtype=tf.float32, shape=[None] + list(env.observation_space.shape), name='ph_agent_s')
+            self.agent_a = tf.placeholder(dtype=tf.float32, shape=[None] + list(env.action_space.shape), name='ph_agent_a')
+            self.expert_a = tf.placeholder(dtype=tf.float32, shape=[None] + list(env.action_space.shape), name='ph_expert_a')
 
             with tf.variable_scope("obfilter"):
                 self.obs_rms = RunningMeanStd(shape=env.observation_space.shape)
             obs_ph_rms = (self.agent_s - self.obs_rms.mean) / self.obs_rms.std
 
-            layer_s = tf.layers.dense(inputs=obs_ph_rms,
-                                      units=self.hidden_size, 
-                                      activation=tf.nn.leaky_relu, 
-                                      name='layer_s')
+            layer_s = tf.layers.dense(inputs=obs_ph_rms, units=self.hidden_size, activation=tf.nn.leaky_relu, name='layer_s')
 
-            layer_a = tf.layers.dense(inputs=self.agent_a, 
-                                      units=self.hidden_size, 
-                                      activation=tf.nn.leaky_relu, 
-                                      name='layer_a')
+            layer_a = tf.layers.dense(inputs=self.agent_a, units=self.hidden_size, activation=tf.nn.leaky_relu, name='layer_a')
 
             layer_s_a = tf.concat([layer_s, layer_a], axis=1)
 
-            layer = tf.layers.dense(inputs=layer_s_a, 
-                                    units=self.hidden_size, 
-                                    activation=tf.nn.leaky_relu, 
-                                    name='layer1')
+            layer = tf.layers.dense(inputs=layer_s_a, units=self.hidden_size, activation=tf.nn.leaky_relu, name='layer1')
 
-            output = tf.layers.dense(inputs=layer, 
-                                     units=env.action_space.shape[0], 
-                                     activation=tf.identity, 
-                                     name='layer2')
+            output = tf.layers.dense(inputs=layer, units=env.action_space.shape[0], activation=tf.identity, name='layer2')
 
             ##########
             # BUG

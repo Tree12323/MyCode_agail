@@ -33,6 +33,7 @@ global flag_render
 flag_render = False
 alpha = 0.5
 
+# 定义奖赏
 def reward_config(true_reward, discriminator_reward, guidance_reward, algo, loss_percent):
     # return order: true reward; d_reward, g_reward
     if algo == 'trpo':
@@ -44,6 +45,7 @@ def reward_config(true_reward, discriminator_reward, guidance_reward, algo, loss
     else:
         raise NotImplementedError
 
+# 添加reward_guidance
 def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stochastic, algo, loss_percent):
     global flag_render
 
@@ -94,8 +96,11 @@ def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stoc
         acs[i] = ac
         prevacs[i] = prevac
 
+        # Discriminator的奖赏
         d_rew = reward_giver.get_reward(ob)
+        # Guidance的奖赏
         g_rew = reward_guidance.get_rewards(agent_s=ob, agent_a=ac)
+        # Environment的奖赏
         ob, true_rew, new, _ = env.step(ac)
 
         true_rew, d_rew, g_rew = reward_config(true_reward=true_rew, 
@@ -106,6 +111,7 @@ def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stoc
 
         if flag_render:
             env.render()
+        # Update Policy的奖赏
         rews[i] = d_rew + g_rew
         true_rews[i] = true_rew
 
@@ -237,6 +243,7 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
 
     # Prepare for rollouts
     # ----------------------------------------
+    # 添加reward_guidance, algo, loss_percent
     seg_gen = traj_segment_generator(pi, env, reward_giver, reward_guidance, timesteps_per_batch, stochastic=True, algo=algo, loss_percent=loss_percent)
 
     episodes_so_far = 0
@@ -356,6 +363,7 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
 
         # ------------------ Update D ------------------
+        # state-based的Discriminator，原来是state-action based
         logger.log("Optimizing Discriminator...")
         logger.log(fmt_row(13, reward_giver.loss_name))
         ob_expert, ac_expert = expert_dataset.get_next_batch(len(ob))
@@ -383,6 +391,7 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
                                                       batch_size=batch_size):
             ob_expert, ac_expert = expert_dataset.get_next_batch(len(ob_batch))
 
+            # 打乱顺序，返回idx
             idx_condition = process_expert(ob_expert, ac_expert)
             pick_idx = (idx_condition >= loss_percent)
             # pick_idx = idx_condition
