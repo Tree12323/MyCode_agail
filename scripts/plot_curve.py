@@ -9,9 +9,11 @@ import matplotlib.pyplot as plt
 
 import plot_util as pu
 
-plt.rcParams['svg.fonttype'] = 'svgfont'
+# plt.rcParams['svg.fonttype'] = 'svgfont'
+plt.rcParams['svg.fonttype'] = 'path'
 # plt.rcParams.update({'font.size': 22})
-font_size = 28
+font_size = 20
+# font_size = 28
 
 matplotlib.rc('xtick', labelsize=font_size) 
 matplotlib.rc('ytick', labelsize=font_size) 
@@ -29,7 +31,8 @@ def main(args):
     if env_name == 'CartPole':
         dir_path = 'log_trpo_cartpole/%s'%(args.env_id)
     else:
-        dir_path = 'log_trpo_mujoco/%s'%(args.env_id)
+        dir_path = 'log_trpo_tmp/%s'%(args.env_id)
+
     results = pu.load_results(dir_path)
 
     pu.plot_results(results, 

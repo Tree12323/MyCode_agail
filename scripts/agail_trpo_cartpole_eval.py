@@ -289,11 +289,11 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
             break
 
         # Save model
-        # if rank == 0 and iters_so_far % save_per_iter == 0 and ckpt_dir is not None:
-        #     fname = os.path.join(ckpt_dir, task_name)
-        #     os.makedirs(os.path.dirname(fname), exist_ok=True)
-        #     saver = tf.train.Saver()
-        #     saver.save(tf.get_default_session(), fname)
+        if rank == 0 and iters_so_far % save_per_iter == 0 and ckpt_dir is not None:
+            fname = os.path.join(ckpt_dir, task_name)
+            os.makedirs(os.path.dirname(fname), exist_ok=True)
+            saver = tf.train.Saver()
+            saver.save(tf.get_default_session(), fname)
 
         logger.log("********** Iteration %i ************" % iters_so_far)
 
@@ -452,15 +452,6 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
             logger.dump_tabular()
 
 
-    if ckpt_dir is not None:
-        print('saving...')
-        fname = os.path.join(ckpt_dir, task_name)
-        os.makedirs(os.path.dirname(fname), exist_ok=True)
-        pi.save(fname)
-        print('save completely and the path:', fname)
-
-
-
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]
 
@@ -586,14 +577,19 @@ def main(args):
               task_name
               )
     elif args.task == 'evaluate':
-        runner(env,
+        avg_len, avg_ret = runner(env,
                policy_fn,
                args.load_model_path,
                timesteps_per_batch=1024,
-               number_trajs=10,
+               number_trajs=100,
                stochastic_policy=args.stochastic_policy,
                save=args.save_sample
                )
+        result = np.array([avg_ret, avg_len])
+        txt_name = args.load_model_path + 'result.txt'
+        np.savetxt(txt_name, result, fmt="%d", delimiter=" ")
+        print(args.load_model_path, avg_ret, avg_len)
+        print('保存成功')
     else:
         raise NotImplementedError
     env.close()
@@ -636,11 +632,18 @@ def runner(env, policy_func, load_model_path, timesteps_per_batch, number_trajs,
     # ----------------------------------------
     ob_space = env.observation_space
     ac_space = env.action_space
-    pi = policy_func("pi", ob_space, ac_space, reuse=reuse)
+
     U.initialize()
-    # Prepare for rollouts
-    # ----------------------------------------
-    U.load_state(load_model_path)
+    policy = build_policy(env, 'mlp', value_network='copy')
+    ob = observation_placeholder(ob_space)
+    with tf.variable_scope('pi'):
+        pi = policy(observ_placeholder=ob)
+
+
+    saver = tf.train.Saver()
+    ckpt = tf.train.get_checkpoint_state(load_model_path)
+    saver.restore(U.get_session(), ckpt.model_checkpoint_path)
+
 
     obs_list = []
     acs_list = []
@@ -664,8 +667,8 @@ def runner(env, policy_func, load_model_path, timesteps_per_batch, number_trajs,
                  lens=np.array(len_list), rets=np.array(ret_list))
     avg_len = sum(len_list)/len(len_list)
     avg_ret = sum(ret_list)/len(ret_list)
-    print("Average length:", avg_len)
-    print("Average return:", avg_ret)
+    # print("Average length:", avg_len)
+    # print("Average return:", avg_ret)
     return avg_len, avg_ret
 
 
@@ -687,12 +690,12 @@ def traj_1_generator(pi, env, horizon, stochastic):
     acs = []
 
     while True:
-        ac, vpred = pi.act(stochastic, ob)
+        ac, vpred, _, _ = pi.step(observation=ob, stochastic=stochastic)
         obs.append(ob)
         news.append(new)
-        acs.append(ac)
+        acs.append(ac[0])
 
-        ob, rew, new, _ = env.step(ac)
+        ob, rew, new, _ = env.step(ac[0])
         rews.append(rew)
 
         cur_ep_ret += rew

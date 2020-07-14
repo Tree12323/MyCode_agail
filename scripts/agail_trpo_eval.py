@@ -11,7 +11,7 @@ import numpy as np
 
 from cg import cg
 from discriminator_mujoco import Discriminator
-from guidance_cartpole import Guidance
+from guidance_mujoco import Guidance
 from utils.mujoco_dset import Mujoco_Dset
 from utils.misc_util import set_global_seeds, zipsame, boolean_flag
 from utils.math_util import explained_variance
@@ -23,20 +23,17 @@ from mpi_adam import MpiAdam
 from statistics import stats
 from mlp_policy_trpo import MlpPolicy
 
-from policies import build_policy
-
 from utils.process_expert import process_expert
 from utils.process_expert import CONDITION_FULL
 from utils.process_expert import CONDITION_NOISY
 from utils.process_expert import CONDITION_PARTIAL
 from utils.process_expert import CONDITION_PARTIAL_NOISY
 
-from utils.input_util import observation_placeholder
-
 global flag_render
 flag_render = False
 alpha = 0.5
 
+# 定义奖赏
 def reward_config(true_reward, discriminator_reward, guidance_reward, algo, loss_percent):
     # return order: true reward; d_reward, g_reward
     if algo == 'trpo':
@@ -44,10 +41,11 @@ def reward_config(true_reward, discriminator_reward, guidance_reward, algo, loss
     elif algo == 'state':
         return true_reward, alpha * discriminator_reward, 0.0
     elif algo == 'agail':
-        return true_reward, discriminator_reward, (1-loss_percent) * guidance_reward
+        return true_reward, alpha * discriminator_reward, (1-alpha) * guidance_reward
     else:
         raise NotImplementedError
 
+# 添加reward_guidance
 def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stochastic, algo, loss_percent):
     global flag_render
 
@@ -77,7 +75,7 @@ def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stoc
 
     while True:
         prevac = ac
-        ac, vpred, _, _ = pi.step(ob, stochastic=stochastic)
+        ac, vpred = pi.act(stochastic=stochastic, ob=ob)
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
@@ -85,7 +83,7 @@ def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stoc
             yield {"ob": obs, "rew": rews, "vpred": vpreds, "new": news,
                    "ac": acs, "prevac": prevacs, "nextvpred": vpred * (1 - new),
                    "ep_rets": ep_rets, "ep_lens": ep_lens, "ep_true_rets": ep_true_rets}
-            _, vpred, _, _ = pi.step(ob, stochastic=stochastic)
+            _, vpred = pi.act(stochastic=stochastic, ob=ob)
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
@@ -98,9 +96,12 @@ def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stoc
         acs[i] = ac
         prevacs[i] = prevac
 
+        # Discriminator的奖赏
         d_rew = reward_giver.get_reward(ob)
+        # Guidance的奖赏
         g_rew = reward_guidance.get_rewards(agent_s=ob, agent_a=ac)
-        ob, true_rew, new, _ = env.step(ac[0])
+        # Environment的奖赏
+        ob, true_rew, new, _ = env.step(ac)
 
         true_rew, d_rew, g_rew = reward_config(true_reward=true_rew, 
                                                discriminator_reward=d_rew, 
@@ -110,6 +111,7 @@ def traj_segment_generator(pi, env, reward_giver, reward_guidance, horizon, stoc
 
         if flag_render:
             env.render()
+        # Update Policy的奖赏
         rews[i] = d_rew + g_rew
         true_rews[i] = true_rew
 
@@ -140,17 +142,6 @@ def add_vtarg_and_adv(seg, gamma, lam):
         gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
-def get_variables(scope):
-    return tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope)
-
-def get_trainable_variables(scope):
-    return tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope)
-
-def get_vf_trainable_variables(scope):
-    return [v for v in get_trainable_variables(scope) if 'vf' in v.name[len(scope):].split('/')]
-
-def get_pi_trainable_variables(scope):
-    return [v for v in get_trainable_variables(scope) if 'pi' in v.name[len(scope):].split('/')]
 
 def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
           pretrained, pretrained_weight, *,
@@ -169,17 +160,12 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
     # ----------------------------------------
     ob_space = env.observation_space
     ac_space = env.action_space
-    policy = build_policy(env, 'mlp', value_network='copy')
-
-    ob = observation_placeholder(ob_space)
-    with tf.variable_scope('pi'):
-        pi = policy(observ_placeholder=ob)
-    with tf.variable_scope('oldpi'):
-        oldpi = policy(observ_placeholder=ob)
-
+    pi = policy_func("pi", ob_space, ac_space, reuse=(pretrained_weight != None))
+    oldpi = policy_func("oldpi", ob_space, ac_space)
     atarg = tf.placeholder(dtype=tf.float32, shape=[None])  # Target advantage function (if applicable)
     ret = tf.placeholder(dtype=tf.float32, shape=[None])  # Empirical return
 
+    ob = U.get_placeholder_cached(name="ob")
     ac = pi.pdtype.sample_placeholder([None])
 
     kloldnew = oldpi.pd.kl(pi.pd)
@@ -188,7 +174,7 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
     meanent = tf.reduce_mean(ent)
     entbonus = entcoeff * meanent
 
-    vferr = tf.reduce_mean(tf.square(pi.vf - ret))
+    vferr = tf.reduce_mean(tf.square(pi.vpred - ret))
 
     ratio = tf.exp(pi.pd.logp(ac) - oldpi.pd.logp(ac))  # advantage * pnew / pold
     surrgain = tf.reduce_mean(ratio * atarg)
@@ -199,15 +185,12 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
 
     dist = meankl
 
-    all_var_list = get_trainable_variables('pi')
-    # var_list = [v for v in all_var_list if v.name.startswith("pi/pol") or v.name.startswith("pi/logstd")]
-    # vf_var_list = [v for v in all_var_list if v.name.startswith("pi/vff")]
-    var_list = get_pi_trainable_variables("pi")
-    vf_var_list = get_vf_trainable_variables("pi")
-    # assert len(var_list) == len(vf_var_list) + 1
+    all_var_list = pi.get_trainable_variables()
+    var_list = [v for v in all_var_list if v.name.startswith("pi/pol") or v.name.startswith("pi/logstd")]
+    vf_var_list = [v for v in all_var_list if v.name.startswith("pi/vff")]
+    assert len(var_list) == len(vf_var_list) + 1
     d_adam = MpiAdam(reward_giver.get_trainable_variables())
     guidance_adam = MpiAdam(reward_guidance.get_trainable_variables())
-
     vfadam = MpiAdam(vf_var_list)
 
     get_flat = U.GetFlat(var_list)
@@ -225,7 +208,7 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
     fvp = U.flatgrad(gvp, var_list)
 
     assign_old_eq_new = U.function([], [], updates=[tf.assign(oldv, newv)
-                                                    for (oldv, newv) in zipsame(get_variables('oldpi'), get_variables('pi'))])
+                                                    for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())])
     compute_losses = U.function([ob, ac, atarg], losses)
     compute_lossandgrad = U.function([ob, ac, atarg], losses + [U.flatgrad(optimgain, var_list)])
     compute_fvp = U.function([flat_tangent, ob, ac, atarg], fvp)
@@ -260,6 +243,7 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
 
     # Prepare for rollouts
     # ----------------------------------------
+    # 添加reward_guidance, algo, loss_percent
     seg_gen = traj_segment_generator(pi, env, reward_giver, reward_guidance, timesteps_per_batch, stochastic=True, algo=algo, loss_percent=loss_percent)
 
     episodes_so_far = 0
@@ -289,11 +273,11 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
             break
 
         # Save model
-        # if rank == 0 and iters_so_far % save_per_iter == 0 and ckpt_dir is not None:
-        #     fname = os.path.join(ckpt_dir, task_name)
-        #     os.makedirs(os.path.dirname(fname), exist_ok=True)
-        #     saver = tf.train.Saver()
-        #     saver.save(tf.get_default_session(), fname)
+        if rank == 0 and iters_so_far % save_per_iter == 0 and ckpt_dir is not None:
+            fname = os.path.join(ckpt_dir, task_name)
+            os.makedirs(os.path.dirname(fname), exist_ok=True)
+            saver = tf.train.Saver()
+            saver.save(tf.get_default_session(), fname)
 
         logger.log("********** Iteration %i ************" % iters_so_far)
 
@@ -367,8 +351,7 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
             with timed("vf"):
                 for _ in range(vf_iters):
                     for (mbob, mbret) in dataset.iterbatches((seg["ob"], seg["tdlamret"]),
-                                                             include_final_partial_batch=False, 
-                                                             batch_size=128):
+                                                             include_final_partial_batch=False, batch_size=128):
                         if hasattr(pi, "ob_rms"):
                             pi.ob_rms.update(mbob)  # update running mean/std for policy
                         g = allmean(compute_vflossandgrad(mbob, mbret))
@@ -380,54 +363,55 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
 
         # ------------------ Update D ------------------
+        # state-based的Discriminator，原来是state-action based
         logger.log("Optimizing Discriminator...")
         logger.log(fmt_row(13, reward_giver.loss_name))
-        ob_expert, ac_expert = expert_dataset.get_next_batch(batch_size=len(ob))
+        ob_expert, ac_expert = expert_dataset.get_next_batch(len(ob))
         batch_size = 128
         d_losses = []  # list of tuples, each of which gives the loss for a minibatch
-        with timed("Discriminator"):
-            for (ob_batch, ac_batch) in dataset.iterbatches((ob, ac),
-                                                        include_final_partial_batch=False,
-                                                        batch_size=batch_size):
-                ob_expert, ac_expert = expert_dataset.get_next_batch(batch_size=batch_size)
-                # update running mean/std for reward_giver
-                if hasattr(reward_giver, "obs_rms"): reward_giver.obs_rms.update(np.concatenate((ob_batch, ob_expert), 0))
-                *newlosses, g = reward_giver.lossandgrad(ob_batch, ob_expert)
-                d_adam.update(allmean(g), d_stepsize)
-                d_losses.append(newlosses)
+        for ob_batch, ac_batch in dataset.iterbatches((ob, ac),
+                                                      include_final_partial_batch=False,
+                                                      batch_size=batch_size):
+            ob_expert, ac_expert = expert_dataset.get_next_batch(len(ob_batch))
+            # update running mean/std for reward_giver
+            if hasattr(reward_giver, "obs_rms"): reward_giver.obs_rms.update(np.concatenate((ob_batch, ob_expert), 0))
+            *newlosses, g = reward_giver.lossandgrad(ob_batch, ob_expert)
+            d_adam.update(allmean(g), d_stepsize)
+            d_losses.append(newlosses)
         logger.log(fmt_row(13, np.mean(d_losses, axis=0)))
 
         # ------------------ Update Guidance ------------
-        logger.log("Optimizing Guidance...")
+        logger.log("Optimizing Discriminator...")
 
         logger.log(fmt_row(13, reward_guidance.loss_name))
         batch_size = 128
         guidance_losses = []  # list of tuples, each of which gives the loss for a minibatch
-        with timed("Guidance"):
-            for ob_batch, ac_batch in dataset.iterbatches((ob, ac),
-                                                        include_final_partial_batch=False,
-                                                        batch_size=batch_size):
-                ob_expert, ac_expert = expert_dataset.get_next_batch(batch_size=batch_size)
+        for ob_batch, ac_batch in dataset.iterbatches((ob, ac),
+                                                      include_final_partial_batch=False,
+                                                      batch_size=batch_size):
+            ob_expert, ac_expert = expert_dataset.get_next_batch(len(ob_batch))
 
-                idx_condition = process_expert(ob_expert, ac_expert)
-                pick_idx = (idx_condition >= loss_percent)
-                # pick_idx = idx_condition
+            # 打乱顺序，返回idx
+            idx_condition = process_expert(ob_expert, ac_expert)
+            pick_idx = (idx_condition >= loss_percent)
+            # pick_idx = idx_condition
 
-                ob_expert_p = ob_expert[pick_idx]
-                ac_expert_p = ac_expert[pick_idx]
+            ob_expert_p = ob_expert[pick_idx]
+            ac_expert_p = ac_expert[pick_idx]
 
-                ac_batch_p = []
-                for each_ob in ob_expert_p:
-                    tmp_ac, _, _, _ = pi.step(each_ob, stochastic=True)
-                    ac_batch_p.append(tmp_ac)
+            ac_batch_p = []
+            for each_ob in ob_expert_p:
+                tmp_ac, _ = pi.act(ob=each_ob, stochastic=True)
+                ac_batch_p.append(tmp_ac)
 
-                # update running mean/std for reward_giver
-                if hasattr(reward_guidance, "obs_rms"): reward_guidance.obs_rms.update(ob_expert_p)
-                # reward_guidance.train(expert_s=ob_batch_p, agent_a=ac_batch_p, expert_a=ac_expert_p)
-                *newlosses, g = reward_guidance.lossandgrad(ob_expert_p, ac_batch_p, ac_expert_p)
-                guidance_adam.update(allmean(g), d_stepsize)
-                guidance_losses.append(newlosses)
+            # update running mean/std for reward_giver
+            if hasattr(reward_guidance, "obs_rms"): reward_guidance.obs_rms.update(ob_expert_p)
+            # reward_guidance.train(expert_s=ob_batch_p, agent_a=ac_batch_p, expert_a=ac_expert_p)
+            *newlosses, g = reward_guidance.lossandgrad(ob_expert_p, ac_batch_p, ac_expert_p)
+            guidance_adam.update(allmean(g), d_stepsize)
+            guidance_losses.append(newlosses)
         logger.log(fmt_row(13, np.mean(guidance_losses, axis=0)))
+
 
         lrlocal = (seg["ep_lens"], seg["ep_rets"], seg["ep_true_rets"])  # local values
         listoflrpairs = MPI.COMM_WORLD.allgather(lrlocal)  # list of tuples
@@ -452,24 +436,15 @@ def learn(env, policy_func, reward_giver, reward_guidance, expert_dataset, rank,
             logger.dump_tabular()
 
 
-    if ckpt_dir is not None:
-        print('saving...')
-        fname = os.path.join(ckpt_dir, task_name)
-        os.makedirs(os.path.dirname(fname), exist_ok=True)
-        pi.save(fname)
-        print('save completely and the path:', fname)
-
-
-
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]
 
 
 def argsparser():
     parser = argparse.ArgumentParser("Tensorflow Implementation of GAIL")
-    parser.add_argument('--env_id', help='environment ID', default='CartPole-v0')
+    parser.add_argument('--env_id', help='environment ID', default='Hopper-v2')
     parser.add_argument('--seed', help='RNG seed', type=int, default=0)
-    parser.add_argument('--expert_path', type=str, default='expert_data/cartpole')
+    parser.add_argument('--expert_path', type=str, default='expert_data/mujoco/stochastic.trpo.Hopper.0.00.npz')
     parser.add_argument('--checkpoint_dir', help='the directory to save model', default='checkpoint')
     parser.add_argument('--log_dir', help='the directory to save log file', default='log')
     parser.add_argument('--load_model_path', help='if provided, load the model', type=str, default=None)
@@ -482,7 +457,7 @@ def argsparser():
     parser.add_argument('--traj_limitation', type=int, default=-1)
     parser.add_argument('--loss_percent', type=float, default=0.0)
     # Optimization Configuration
-    parser.add_argument('--g_step', help='number of steps to train policy in each epoch', type=int, default=1)
+    parser.add_argument('--g_step', help='number of steps to train policy in each epoch', type=int, default=3)
     parser.add_argument('--d_step', help='number of steps to train discriminator in each epoch', type=int, default=1)
     # Network Configuration (Using MLP Policy)
     parser.add_argument('--policy_hidden_size', type=int, default=100)
@@ -494,10 +469,10 @@ def argsparser():
     parser.add_argument('--adversary_entcoeff', help='entropy coefficiency of discriminator', type=float, default=1e-3)
     # Traing Configuration
     parser.add_argument('--save_per_iter', help='save model every xx iterations', type=int, default=100)
-    parser.add_argument('--num_timesteps', help='number of timesteps per episode', type=int, default=1e6)
+    parser.add_argument('--num_timesteps', help='number of timesteps per episode', type=int, default=2e6)
     # Behavior Cloning
     boolean_flag(parser, 'pretrained', default=False, help='Use BC to pretrain')
-    parser.add_argument('--BC_max_iter', help='Max iteration for training BC', type=int, default=None)
+    parser.add_argument('--BC_max_iter', help='Max iteration for training BC', type=int, default=1e4)
     return parser.parse_args()
 
 
@@ -519,6 +494,10 @@ def get_task_name(args):
     return task_name
 
 def get_task_short_name(args):
+    if args.stochastic_policy:
+        task_name = "stochastic."
+    else:
+        task_name = "deterministic."
     task_name = args.env_id.split("-")[0] + '/'
     # plot_results considers digits after dash 
     # at the end of the directory name to be 
@@ -537,16 +516,18 @@ def get_task_short_name(args):
     task_name += str(args.seed)
     return task_name
 
+
 def main(args):
     U.make_session(num_cpu=1).__enter__()
     set_global_seeds(args.seed)
     env = gym.make(args.env_id)
 
     task_name = get_task_short_name(args)
-    logger.configure(dir='log_trpo_cartpole/%s'%task_name)
+    logger.configure(dir='log_trpo_mujoco/%s'%task_name)
 
     def policy_fn(name, ob_space, ac_space, reuse=False):
-        return build_policy(env, 'mlp', value_network='copy')
+        return MlpPolicy(name=name, ob_space=ob_space, ac_space=ac_space,
+                                    reuse=reuse, hid_size=args.policy_hidden_size, num_hid_layers=2)
     import logging
     import os.path as osp
     import bench
@@ -559,11 +540,7 @@ def main(args):
     args.log_dir = osp.join(args.log_dir, task_name)
 
     if args.task == 'train':
-        from utils.mujoco_dset import Dset_gym
-        expert_observations = np.genfromtxt('expert_data/cartpole/observations.csv')
-        expert_actions = np.genfromtxt('expert_data/cartpole/actions.csv', dtype=np.int32)
-        expert_dataset = Dset_gym(inputs=expert_observations, labels=expert_actions, randomize=True)
-        # expert_dataset = (expert_observations, expert_actions)
+        expert_dataset = Mujoco_Dset(expert_path=args.expert_path, traj_limitation=args.traj_limitation)
         reward_giver = Discriminator(env, args.adversary_hidden_size, entcoeff=args.adversary_entcoeff)
         reward_guidance = Guidance(env, args.policy_hidden_size, expert_dataset=expert_dataset)
         train(env,
@@ -586,14 +563,20 @@ def main(args):
               task_name
               )
     elif args.task == 'evaluate':
-        runner(env,
+        avg_len, avg_ret = runner(env,
                policy_fn,
                args.load_model_path,
                timesteps_per_batch=1024,
-               number_trajs=10,
+               number_trajs=100,
                stochastic_policy=args.stochastic_policy,
                save=args.save_sample
                )
+
+        result = np.array([avg_ret, avg_len])
+        txt_name = args.load_model_path + 'result.txt'
+        np.savetxt(txt_name, result, fmt="%d", delimiter=" ")
+        print(args.load_model_path, avg_ret, avg_len)
+        print('保存成功')
     else:
         raise NotImplementedError
     env.close()
@@ -640,7 +623,10 @@ def runner(env, policy_func, load_model_path, timesteps_per_batch, number_trajs,
     U.initialize()
     # Prepare for rollouts
     # ----------------------------------------
-    U.load_state(load_model_path)
+    # U.load_state(load_model_path)
+    saver = tf.train.Saver()
+    ckpt = tf.train.get_checkpoint_state(load_model_path)
+    saver.restore(U.get_session(), ckpt.model_checkpoint_path)
 
     obs_list = []
     acs_list = []
@@ -664,8 +650,8 @@ def runner(env, policy_func, load_model_path, timesteps_per_batch, number_trajs,
                  lens=np.array(len_list), rets=np.array(ret_list))
     avg_len = sum(len_list)/len(len_list)
     avg_ret = sum(ret_list)/len(ret_list)
-    print("Average length:", avg_len)
-    print("Average return:", avg_ret)
+    # print("Average length:", avg_len)
+    # print("Average return:", avg_ret)
     return avg_len, avg_ret
 
 
@@ -687,7 +673,7 @@ def traj_1_generator(pi, env, horizon, stochastic):
     acs = []
 
     while True:
-        ac, vpred = pi.act(stochastic, ob)
+        ac, vpred = pi.act(stochastic=stochastic, ob=ob)
         obs.append(ob)
         news.append(new)
         acs.append(ac)

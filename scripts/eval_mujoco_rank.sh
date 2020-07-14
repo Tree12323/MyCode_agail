@@ -1,0 +1,16 @@
+sh eval2_Hopper_00.sh
+sh eval2_Hopper_25.sh
+sh eval2_Hopper_50.sh
+sh eval2_Hopper_75.sh
+sh eval2_InvertedPendulum_00.sh
+sh eval2_InvertedPendulum_25.sh
+sh eval2_InvertedPendulum_50.sh
+sh eval2_InvertedPendulum_75.sh
+sh eval2_InvertedDoublePendulum_00.sh
+sh eval2_InvertedDoublePendulum_25.sh
+sh eval2_InvertedDoublePendulum_50.sh
+sh eval2_InvertedDoublePendulum_75.sh
+sh eval2_Humanoid_00.sh
+sh eval2_Humanoid_25.sh
+sh eval2_Humanoid_50.sh
+sh eval2_Humanoid_75.sh
